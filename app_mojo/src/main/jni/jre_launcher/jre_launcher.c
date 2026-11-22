@@ -1,6 +1,6 @@
 //
 // Created by maks on 20.09.2025.
-//
+// Updated by kove
 
 #include <jni.h>
 #include <dlfcn.h>
@@ -67,9 +67,7 @@ _Noreturn static void vm_abort() {
 static bool loadJavaVM(java_vm_t* java_vm, const char* jvm_path) {
     java_vm->handle = dlopen(jvm_path, RTLD_NOW | RTLD_GLOBAL);
     if(java_vm->handle == NULL) return false;
-#define JVM_LOAD(name) java_vm->name = dlsym(java_vm->handle, #name)
-    JVM_LOAD(JNI_CreateJavaVM);
-#undef JVM_LOAD
+    java_vm->JNI_CreateJavaVM = dlsym(java_vm->handle, "JNI_CreateJavaVM");
     return java_vm->JNI_CreateJavaVM != NULL;
 }
 
@@ -102,15 +100,15 @@ void vm_hinter_free(vm_hinter_t* hinter, bool hasJavaAgents) {
 }
 
 static bool initializeJavaVM(java_vm_t* java_vm, JNIEnv *env, jstring* vmpath, heap_str_array* vmargs, bool hasJavaAgents) {
-    char* fail_msg;
-#define FAIL(msg) {fail_msg = msg; goto fail;}
-
     const char* jvm_path = (*env)->GetStringUTFChars(env, vmpath, NULL);
-    if(!loadJavaVM(java_vm, jvm_path)) {
-        throwException(env, STAGE_LOAD_RUNTIME, JNI_ERR, dlerror());
-        return false;
+    {
+    bool loaded = loadJavaVM(java_vm, jvm_path);
+    (*env)->ReleaseStringUTFChars(env, vmpath, jvm_path);
+    	if(!loaded) {
+        	throwException(env, STAGE_LOAD_RUNTIME, JNI_ERR, dlerror());
+        	return false;
+    	}
     }
-
     jint userArgsCount = vmargs->length;
     jint javaVmArgsCount = userArgsCount + 2; // for exit and abort hooks
     JavaVMOption javaVmOptions[javaVmArgsCount];
@@ -118,7 +116,13 @@ static bool initializeJavaVM(java_vm_t* java_vm, JNIEnv *env, jstring* vmpath, h
     for(jint i = 0; i < userArgsCount; i++) {
         const char* arg = vmargs->strings[i];
         LOGI("VM arg: %s",arg);
-        if(arg == NULL) FAIL("Unexpected NULL argument")
+        if(arg == NULL) 
+        {
+        hstr_free(vmargs);
+        dlclose(java_vm->handle);
+        throwException(env, STAGE_CREATE_RUNTIME, JNI_ERR, 	"Unexpected NULL argument");
+        return false;
+        }
         javaVmOptions[i].optionString = arg;
     }
 
@@ -146,17 +150,10 @@ static bool initializeJavaVM(java_vm_t* java_vm, JNIEnv *env, jstring* vmpath, h
         return false;
     }
     return true;
-
-    fail:
-    hstr_free(vmargs);
-    dlclose(java_vm->handle);
-    throwException(env, STAGE_CREATE_RUNTIME, JNI_ERR, fail_msg);
-    return false;
-#undef FAIL
 }
 
 static bool executeMain(JNIEnv* vm_env, const char* mainClass, jobjectArray vm_appArgs) {
-#define EXCEPTION_CHECK if((*vm_env)->ExceptionCheck(vm_env)) {(*vm_env)->ExceptionDescribe(vm_env); return false;}
+#define GOTO_IF_EXCEPTION_CHECK if((*vm_env)->ExceptionCheck(vm_env)) goto exception_check
     size_t classNameLen = strlen(mainClass) + 1;
     char mainClassSlashed[classNameLen];
     for(size_t i = 0; i < classNameLen; i++) {
@@ -164,11 +161,17 @@ static bool executeMain(JNIEnv* vm_env, const char* mainClass, jobjectArray vm_a
         if(nameChar == '.') nameChar = '/';
         mainClassSlashed[i] = nameChar;
     }
-    jclass mainClassObj = (*vm_env)->FindClass(vm_env, mainClassSlashed); EXCEPTION_CHECK
-    jmethodID mainMethod = (*vm_env)->GetStaticMethodID(vm_env, mainClassObj, "main", "([Ljava/lang/String;)V"); EXCEPTION_CHECK
-    (*vm_env)->CallStaticVoidMethod(vm_env, mainClassObj, mainMethod, vm_appArgs); EXCEPTION_CHECK
+    jclass mainClassObj = (*vm_env)->FindClass(vm_env, mainClassSlashed); 
+    GOTO_IF_EXCEPTION_CHECK;
+    jmethodID mainMethod = (*vm_env)->GetStaticMethodID(vm_env, mainClassObj, "main", "([Ljava/lang/String;)V"); 
+    GOTO_IF_EXCEPTION_CHECK;
+    (*vm_env)->CallStaticVoidMethod(vm_env, mainClassObj, mainMethod, vm_appArgs); 
+    GOTO_IF_EXCEPTION_CHECK;
     return true;
-#undef EXCEPTION_CHECK
+    exception_check:
+    (*vm_env)->ExceptionDescribe(vm_env); 
+    return false;
+    #undef GOTO_IF_EXCEPTION_CHECK
 }
 
 static void unloadJavaVM(java_vm_t* java_vm) {
@@ -196,21 +199,24 @@ extern bool installClassLoaderHooks(JNIEnv *env, JNIEnv* vm_env);
 
 JNIEXPORT jboolean JNICALL
 Java_git_artdeell_mojo_utils_jre_JavaRunner_nativeLoadJVM(JNIEnv *env, jclass clazz, jstring vmpath, jlong vmArgsL, jstring mainClass, jlong appArgsL, jboolean hasJavaAgents) {
+	(void)clazz;
     heap_str_array* vmArgs = (heap_str_array*) vmArgsL;
     heap_str_array* appArgs = (heap_str_array*) appArgsL;
     java_vm_t java_vm;
     setup_abort_wait();
     prepareSignalHandlers();
-    if(!initializeJavaVM(&java_vm, env, vmpath, vmArgs, hasJavaAgents)) {
-        hstr_free(appArgs);
-        return JNI_FALSE;
-    }
+    
+    if(!initializeJavaVM(&java_vm, env, vmpath, vmArgs, hasJavaAgents)) 
+    goto hstr_cleanup;
+    
     JNIEnv *vm_env = java_vm.vm_env;
+    
     if(!installClassLoaderHooks(env, vm_env)) {
-        hstr_free(appArgs);
-        return JNI_FALSE;
+    	hstr_cleanup:
+    	hstr_free(appArgs);
+    	return JNI_FALSE;
     }
-
+    
     hookExec(vm_env);
 
     jobjectArray vm_appArgs = hstr_to_jni(vm_env, appArgs, true);
@@ -231,11 +237,11 @@ Java_git_artdeell_mojo_utils_jre_JavaRunner_nativeLoadJVM(JNIEnv *env, jclass cl
     }else {
         return JNI_TRUE;
     }
-    // If the main method exits
 }
 
 JNIEXPORT jlong JNICALL
 Java_git_artdeell_mojo_utils_jre_JavaRunner_nativeTransferArguments(JNIEnv *env, jclass clazz,
                                                                       jobjectArray args) {
+    (void)clazz;
     return (jlong) hstr_from_jni(env, args);
 }
